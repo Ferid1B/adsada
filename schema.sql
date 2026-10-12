@@ -28,9 +28,21 @@ create table if not exists public.ranked_progress (
   hero_hp integer not null default 100 check (hero_hp between 1 and 100),
   potions integer not null default 3 check (potions >= 0),
   gold integer not null default 250 check (gold >= 0),
+  bag jsonb not null default '{"blade":1,"coat":1}'::jsonb,
+  equipment jsonb not null default '{"weapon":"blade","armor":"coat","charm":null}'::jsonb,
+  claimed_quests text[] not null default '{}',
+  hunger integer not null default 100 check (hunger between 0 and 100),
+  last_work_at timestamptz,
   battle jsonb,
   updated_at timestamptz not null default now()
 );
+
+alter table public.ranked_progress
+  add column if not exists bag jsonb not null default '{"blade":1,"coat":1}'::jsonb,
+  add column if not exists equipment jsonb not null default '{"weapon":"blade","armor":"coat","charm":null}'::jsonb,
+  add column if not exists claimed_quests text[] not null default '{}',
+  add column if not exists hunger integer not null default 100 check (hunger between 0 and 100),
+  add column if not exists last_work_at timestamptz;
 
 alter table public.ranked_progress enable row level security;
 drop policy if exists "players read own ranked progress" on public.ranked_progress;
@@ -54,7 +66,11 @@ as $$
     'hero_hp', p.hero_hp,
     'potions', p.potions,
     'gold', p.gold,
-    'battles_since_guardian', p.battles_since_guardian
+    'battles_since_guardian', p.battles_since_guardian,
+    'bag', p.bag,
+    'equipment', p.equipment,
+    'claimed', to_jsonb(p.claimed_quests),
+    'hunger', p.hunger
   );
 $$;
 
@@ -137,6 +153,8 @@ begin
       'profile', public.ranked_profile_json(v_profile)
     );
   end if;
+  if v_profile.hunger < 4 then raise exception 'Not enough hunger to enter the dungeon'; end if;
+  v_profile.hunger := v_profile.hunger - 4;
 
   v_guardian := v_profile.battles_since_guardian >= 3;
   if v_guardian then
@@ -165,6 +183,7 @@ begin
         'attack', v_attack,
         'skillCooldown', 0
       ),
+      hunger = v_profile.hunger,
       updated_at = now()
   where user_id = v_user_id
   returning * into v_profile;
@@ -198,6 +217,8 @@ declare
   v_reward_xp integer;
   v_reward_gold integer;
   v_enemy_name text;
+  v_weapon_attack integer;
+  v_armor_value integer;
 begin
   if v_user_id is null then raise exception 'Sign in is required'; end if;
   if p_action not in ('attack', 'defend', 'skill', 'potion', 'flee') then
@@ -211,6 +232,12 @@ begin
   v_hero_hp := v_profile.hero_hp;
   v_enemy_hp := (v_battle->>'hp')::integer;
   v_enemy_name := v_battle->>'name';
+  v_weapon_attack := case v_profile.equipment->>'weapon'
+    when 'blade' then 4 when 'saber' then 8 when 'sword' then 14 else 0 end
+    + case when v_profile.equipment->>'charm' = 'charm' then 3 else 0 end;
+  v_armor_value := case v_profile.equipment->>'armor'
+    when 'coat' then 2 when 'armor' then 7 when 'plate' then 13 else 0 end
+    + case when v_profile.equipment->>'charm' = 'charm' then 2 else 0 end;
 
   if p_action = 'flee' then
     if v_guardian then raise exception 'Cannot flee from a guardian'; end if;
@@ -223,7 +250,7 @@ begin
   elsif p_action = 'attack' then
     v_hit := random() < 0.84;
     if v_hit then
-      v_damage := 13 + floor(random() * 14)::integer;
+      v_damage := 13 + floor(random() * 14)::integer + v_weapon_attack;
       v_enemy_hp := greatest(0, v_enemy_hp - v_damage);
       v_message := 'Удар: ' || v_damage || ' урона.';
     else
@@ -231,7 +258,7 @@ begin
     end if;
   elsif p_action = 'skill' then
     if (v_battle->>'skillCooldown')::integer > 0 then raise exception 'Skill is on cooldown'; end if;
-    v_damage := 26 + floor(random() * 7)::integer;
+    v_damage := 26 + floor(random() * 7)::integer + v_weapon_attack;
     v_enemy_hp := greatest(0, v_enemy_hp - v_damage);
     v_battle := jsonb_set(v_battle, '{skillCooldown}', '3'::jsonb);
     v_message := 'Точный удар наносит ' || v_damage || ' урона.';
@@ -283,7 +310,7 @@ begin
   end if;
 
   if random() >= 0.10 then
-    v_damage := greatest(1, (v_battle->>'attack')::integer + floor(random() * 6)::integer - 2 - 1);
+    v_damage := greatest(1, (v_battle->>'attack')::integer + floor(random() * 6)::integer - 2 - 1 - floor(v_armor_value * 0.5)::integer);
     if v_defended then v_damage := greatest(1, floor(v_damage * 0.4)::integer); end if;
     v_hero_hp := greatest(0, v_hero_hp - v_damage);
     v_message := v_message || ' ' || v_enemy_name || ' наносит ' || v_damage || ' урона.';
@@ -316,6 +343,116 @@ begin
   );
 end;
 $$;
+
+create or replace function public.ranked_economy_action(
+  p_action text,
+  p_item text default null,
+  p_quest text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_profile public.ranked_progress;
+  v_price integer;
+  v_value integer;
+  v_slot text;
+  v_count integer;
+  v_reward integer;
+  v_requirement boolean;
+  v_quest_id text;
+begin
+  if v_user_id is null then raise exception 'Sign in is required'; end if;
+  if p_action not in ('buy_item', 'sell_item', 'equip_item', 'buy_potion', 'eat', 'work', 'claim_quest') then
+    raise exception 'Invalid economy action';
+  end if;
+  select * into v_profile
+  from public.ranked_progress
+  where user_id = v_user_id
+  for update;
+  if not found then raise exception 'Create a ranked profile first'; end if;
+  if v_profile.battle is not null then raise exception 'Finish the active battle first'; end if;
+
+  if p_action = 'buy_item' then
+    v_price := case p_item when 'saber' then 85 when 'armor' then 95 when 'sword' then 190 when 'plate' then 225 when 'charm' then 140 else null end;
+    if v_price is null then raise exception 'This item cannot be purchased'; end if;
+    if v_profile.gold < v_price then raise exception 'Not enough ranked gold'; end if;
+    v_profile.gold := v_profile.gold - v_price;
+    v_profile.bag := jsonb_set(v_profile.bag, array[p_item], to_jsonb(coalesce((v_profile.bag->>p_item)::integer, 0) + 1), true);
+  elsif p_action = 'sell_item' then
+    v_value := case p_item when 'blade' then 8 when 'coat' then 8 when 'saber' then 85 when 'sword' then 190 when 'armor' then 95 when 'plate' then 225 when 'charm' then 140 else null end;
+    if v_value is null then raise exception 'This item cannot be sold'; end if;
+    v_count := coalesce((v_profile.bag->>p_item)::integer, 0);
+    if v_count < 1 then raise exception 'Item is not in inventory'; end if;
+    if v_profile.equipment->>'weapon' = p_item or v_profile.equipment->>'armor' = p_item or v_profile.equipment->>'charm' = p_item then
+      if v_count <= 1 then raise exception 'Unequip the item before selling it'; end if;
+    end if;
+    v_profile.bag := jsonb_set(v_profile.bag, array[p_item], to_jsonb(v_count - 1), true);
+    v_profile.gold := v_profile.gold + v_value;
+  elsif p_action = 'equip_item' then
+    v_slot := case
+      when p_item in ('blade', 'saber', 'sword') then 'weapon'
+      when p_item in ('coat', 'armor', 'plate') then 'armor'
+      when p_item = 'charm' then 'charm'
+      else null
+    end;
+    if v_slot is null then raise exception 'This item cannot be equipped'; end if;
+    if coalesce((v_profile.bag->>p_item)::integer, 0) < 1 then raise exception 'Item is not in inventory'; end if;
+    v_profile.equipment := jsonb_set(v_profile.equipment, array[v_slot], to_jsonb(p_item), true);
+  elsif p_action = 'buy_potion' then
+    if v_profile.potions >= 3 then raise exception 'Potion capacity reached'; end if;
+    if v_profile.gold < 35 then raise exception 'Not enough ranked gold'; end if;
+    v_profile.gold := v_profile.gold - 35;
+    v_profile.potions := v_profile.potions + 1;
+  elsif p_action = 'eat' then
+    if v_profile.hunger >= 100 then raise exception 'You are not hungry'; end if;
+    if v_profile.gold < 15 then raise exception 'Not enough ranked gold'; end if;
+    v_profile.gold := v_profile.gold - 15;
+    v_profile.hunger := least(100, v_profile.hunger + 45);
+  elsif p_action = 'work' then
+    if v_profile.hunger < 8 then raise exception 'Not enough hunger to work'; end if;
+    if v_profile.last_work_at is not null and v_profile.last_work_at > now() - interval '30 minutes' then
+      raise exception 'Work is available again after 30 minutes';
+    end if;
+    v_profile.gold := v_profile.gold + 18;
+    v_profile.hunger := v_profile.hunger - 8;
+    v_profile.last_work_at := now();
+  elsif p_action = 'claim_quest' then
+    v_quest_id := p_quest;
+    v_reward := case v_quest_id when 'first' then 45 when 'hunter' then 120 when 'guardian' then 160 when 'veteran' then 220 else null end;
+    if v_reward is null then raise exception 'Unknown quest'; end if;
+    if v_quest_id = any(v_profile.claimed_quests) then raise exception 'Quest reward already claimed'; end if;
+    v_requirement := case v_quest_id
+      when 'first' then v_profile.kills >= 1
+      when 'hunter' then v_profile.kills >= 5
+      when 'guardian' then v_profile.depth >= 2
+      when 'veteran' then v_profile.level >= 5
+      else false end;
+    if not v_requirement then raise exception 'Quest is not complete'; end if;
+    v_profile.gold := v_profile.gold + v_reward;
+    v_profile.claimed_quests := array_append(v_profile.claimed_quests, v_quest_id);
+  end if;
+
+  update public.ranked_progress
+  set gold = v_profile.gold,
+      bag = v_profile.bag,
+      equipment = v_profile.equipment,
+      claimed_quests = v_profile.claimed_quests,
+      potions = v_profile.potions,
+      hunger = v_profile.hunger,
+      last_work_at = v_profile.last_work_at,
+      updated_at = now()
+  where user_id = v_user_id
+  returning * into v_profile;
+  return jsonb_build_object('profile', public.ranked_profile_json(v_profile));
+end;
+$$;
+
+revoke all on function public.ranked_economy_action(text, text, text) from public, anon, authenticated;
+grant execute on function public.ranked_economy_action(text, text, text) to authenticated;
 
 revoke all on function public.ranked_profile_json(public.ranked_progress) from public, anon, authenticated;
 revoke all on function public.ranked_start_profile(text) from public, anon, authenticated;
