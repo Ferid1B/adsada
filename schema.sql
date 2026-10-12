@@ -39,7 +39,7 @@ create table if not exists public.ranked_progress (
   claimed_quests text[] not null default '{}',
   hunger integer not null default 100 check (hunger between 0 and 100),
   last_work_at timestamptz,
-  exploration_index integer not null default 0 check (exploration_index between 0 and 5),
+  exploration_index integer not null default 0 check (exploration_index between 0 and 11),
   run_gold integer not null default 0 check (run_gold >= 0),
   battle jsonb,
   updated_at timestamptz not null default now()
@@ -51,7 +51,7 @@ alter table public.ranked_progress
   add column if not exists claimed_quests text[] not null default '{}',
   add column if not exists hunger integer not null default 100 check (hunger between 0 and 100),
   add column if not exists last_work_at timestamptz,
-  add column if not exists exploration_index integer not null default 0 check (exploration_index between 0 and 5),
+  add column if not exists exploration_index integer not null default 0,
   add column if not exists run_gold integer not null default 0 check (run_gold >= 0),
   add column if not exists max_hp integer not null default 100 check (max_hp >= 1),
   add column if not exists attributes jsonb not null default '{"strength":5,"agility":5,"endurance":5,"intellect":5,"luck":3,"will":4}'::jsonb,
@@ -59,6 +59,8 @@ alter table public.ranked_progress
   add column if not exists pvp_rating integer not null default 1000 check (pvp_rating >= 0),
   add column if not exists pvp_wins integer not null default 0 check (pvp_wins >= 0),
   add column if not exists pvp_losses integer not null default 0 check (pvp_losses >= 0);
+alter table public.ranked_progress drop constraint if exists ranked_progress_exploration_index_check;
+alter table public.ranked_progress add constraint ranked_progress_exploration_index_check check (exploration_index between 0 and 11);
 alter table public.ranked_progress drop constraint if exists ranked_progress_hero_hp_check;
 alter table public.ranked_progress drop constraint if exists ranked_progress_hero_hp_max_check;
 alter table public.ranked_progress add constraint ranked_progress_hero_hp_max_check check (hero_hp <= max_hp);
@@ -564,6 +566,7 @@ declare
   v_profile public.ranked_progress;
   v_battle jsonb;
   v_guardian boolean;
+  v_elite boolean;
   v_hero_hp integer;
   v_enemy_hp integer;
   v_damage integer;
@@ -573,6 +576,7 @@ declare
   v_outcome text := 'turn';
   v_reward_xp integer;
   v_reward_gold integer;
+  v_item text;
   v_enemy_name text;
   v_weapon_attack integer;
   v_armor_value integer;
@@ -591,6 +595,7 @@ begin
   if not found or v_profile.battle is null then raise exception 'No active battle'; end if;
   v_battle := v_profile.battle;
   v_guardian := (v_battle->>'guardian')::boolean;
+  v_elite := coalesce((v_battle->>'elite')::boolean, false);
   v_hero_hp := v_profile.hero_hp;
   v_enemy_hp := (v_battle->>'hp')::integer;
   v_enemy_name := v_battle->>'name';
@@ -642,8 +647,8 @@ begin
   end if;
 
   if v_enemy_hp = 0 then
-    v_reward_xp := case when v_guardian then 70 else 28 end + v_profile.depth * 12;
-    v_reward_gold := 18 + v_profile.depth * 8 + floor(random() * 16)::integer;
+    v_reward_xp := case when v_guardian then 70 when v_elite then 50 else 28 end + v_profile.depth * case when v_elite then 15 else 12 end;
+    v_reward_gold := 18 + v_profile.depth * 8 + floor(random() * 16)::integer + case when v_elite then 25 else 0 end;
     v_profile.xp := v_profile.xp + v_reward_xp;
     while v_profile.xp >= v_profile.level * 100 loop
       v_profile.xp := v_profile.xp - v_profile.level * 100;
@@ -652,7 +657,7 @@ begin
       v_profile.hero_hp := least(v_profile.max_hp, v_profile.hero_hp + 15);
     end loop;
     v_profile.kills := v_profile.kills + 1;
-    v_profile.gold := v_profile.gold + v_reward_gold;
+    v_profile.run_gold := v_profile.run_gold + v_reward_gold;
     if v_guardian then
       v_profile.wins := v_profile.wins + 1;
       v_profile.depth := v_profile.depth + 1;
@@ -662,17 +667,30 @@ begin
     end if;
     v_profile.hero_hp := greatest(1, v_hero_hp);
     v_profile.potions := least(3, v_profile.potions + 1);
+    if v_elite and random() < 0.4 then
+      v_item := case
+        when v_profile.depth >= 4 and random() < 0.25 then 'plate'
+        when v_profile.depth >= 4 and random() < 0.5 then 'sword'
+        when v_profile.depth >= 2 and random() < 0.5 then 'armor'
+        when random() < 0.5 then 'charm'
+        else 'saber'
+      end;
+      v_profile.bag := jsonb_set(v_profile.bag, array[v_item], to_jsonb(coalesce((v_profile.bag->>v_item)::integer, 0) + 1), true);
+      v_message := v_message || ' Найден трофей: ' || case v_item when 'saber' then 'Шахтёрская сабля' when 'armor' then 'Панцирь стража' when 'charm' then 'Амулет подземья' when 'sword' then 'Клинок сумерек' else 'Доспех искателя' end || '.';
+    end if;
     v_profile.battle := null;
     update public.ranked_progress set
       level = v_profile.level, xp = v_profile.xp, depth = v_profile.depth,
       kills = v_profile.kills, wins = v_profile.wins,
+      run_gold = v_profile.run_gold,
       gold = v_profile.gold,
       battles_since_guardian = v_profile.battles_since_guardian,
       hero_hp = v_profile.hero_hp, potions = v_profile.potions,
       stat_points = v_profile.stat_points,
+      bag = v_profile.bag,
       battle = null, updated_at = now()
     where user_id = v_user_id returning * into v_profile;
-    return jsonb_build_object('outcome', 'victory', 'message', v_message || ' Победа! +' || v_reward_xp || ' опыта и ' || v_reward_gold || ' золота.', 'profile', public.ranked_profile_json(v_profile));
+    return jsonb_build_object('outcome', 'victory', 'message', v_message || ' Победа! +' || v_reward_xp || ' опыта и ' || v_reward_gold || ' золота в походную сумку.', 'profile', public.ranked_profile_json(v_profile));
   end if;
 
   v_battle := jsonb_set(v_battle, '{hp}', to_jsonb(v_enemy_hp));
@@ -697,6 +715,7 @@ begin
     v_profile.battles_since_guardian := 0;
     v_profile.potions := least(3, v_profile.potions + 1);
     v_profile.run_gold := 0;
+    v_profile.exploration_index := 0;
     v_profile.hero_hp := 1;
     v_profile.battle := null;
   else
@@ -707,6 +726,7 @@ begin
     hero_hp = v_profile.hero_hp, potions = v_profile.potions,
     battles_since_guardian = v_profile.battles_since_guardian,
     run_gold = v_profile.run_gold,
+    exploration_index = v_profile.exploration_index,
     battle = v_profile.battle, updated_at = now()
   where user_id = v_user_id returning * into v_profile;
   return jsonb_build_object(
@@ -851,6 +871,7 @@ declare
   v_icon text;
   v_max_hp integer;
   v_attack integer;
+  v_elite boolean := false;
   v_outcome text := 'event';
 begin
   if v_user_id is null then raise exception 'Sign in is required'; end if;
@@ -867,7 +888,7 @@ begin
     v_profile.gold := v_profile.gold + v_profile.run_gold;
     v_profile.run_gold := 0;
     update public.ranked_progress
-    set gold = v_profile.gold, run_gold = 0, updated_at = now()
+    set gold = v_profile.gold, run_gold = 0, exploration_index = 0, updated_at = now()
     where user_id = v_user_id returning * into v_profile;
     return jsonb_build_object(
       'outcome', 'left',
@@ -877,7 +898,7 @@ begin
   end if;
   if v_profile.hunger < 4 then raise exception 'Not enough hunger to explore'; end if;
 
-  v_next_event := (v_profile.exploration_index + 1) % 6;
+  v_next_event := (v_profile.exploration_index + 1 + floor(random() * 11)::integer) % 12;
   case v_profile.exploration_index
     when 0 then v_action := case p_choice when 0 then 'fight' else 'loot' end;
     when 1 then v_action := case p_choice when 0 then 'treasure' else 'fight' end;
@@ -885,24 +906,38 @@ begin
     when 3 then v_action := case p_choice when 0 then 'spring' else 'treasure' end;
     when 4 then v_action := case p_choice when 0 then 'loot' else 'fight' end;
     when 5 then v_action := case p_choice when 0 then 'runes' else 'fight' end;
+    when 6 then v_action := case p_choice when 0 then 'fight' else 'cache' end;
+    when 7 then v_action := case p_choice when 0 then 'rations' else 'trap' end;
+    when 8 then v_action := case p_choice when 0 then 'shrine' else 'fight' end;
+    when 9 then v_action := case p_choice when 0 then 'cache' else 'trap' end;
+    when 10 then v_action := case p_choice when 0 then 'elite' else 'runes' end;
+    when 11 then v_action := case p_choice when 0 then 'cache' else 'rations' end;
     else raise exception 'Invalid exploration state';
   end case;
 
   v_profile.hunger := v_profile.hunger - 4;
   v_profile.exploration_index := v_next_event;
-  if v_action = 'fight' then
+  if v_action in ('fight', 'elite') then
     v_guardian := v_profile.battles_since_guardian >= 3;
+    v_elite := v_action = 'elite' and not v_guardian;
     if v_guardian then
       v_enemy_name := 'Хранитель прохода';
       v_icon := '👹';
       v_max_hp := 65 + v_profile.depth * 23 + floor(random() * 9)::integer;
       v_attack := 8 + v_profile.depth * 3 + floor(random() * 4)::integer;
+    elsif v_elite then
+      v_enemy_name := 'Смотритель катакомб';
+      v_icon := '🗿';
+      v_max_hp := 75 + v_profile.depth * 18 + floor(random() * 9)::integer;
+      v_attack := 10 + v_profile.depth * 2 + floor(random() * 4)::integer;
     else
-      case floor(random() * 4)::integer
+      case floor(random() * 6)::integer
         when 0 then v_enemy_name := 'Пещерный зверь'; v_icon := '🐺';
         when 1 then v_enemy_name := 'Костяной дозорный'; v_icon := '💀';
         when 2 then v_enemy_name := 'Голодный ползун'; v_icon := '🕷';
-        else v_enemy_name := 'Крысолов'; v_icon := '🐀';
+        when 3 then v_enemy_name := 'Крысолов'; v_icon := '🐀';
+        when 4 then v_enemy_name := 'Слепой летун'; v_icon := '🦇';
+        else v_enemy_name := 'Кристальный краб'; v_icon := '🦀';
       end case;
       v_max_hp := 32 + v_profile.depth * 12 + floor(random() * 9)::integer;
       v_attack := 5 + v_profile.depth * 2 + floor(random() * 4)::integer;
@@ -911,6 +946,7 @@ begin
       'name', v_enemy_name,
       'icon', v_icon,
       'guardian', v_guardian,
+      'elite', v_elite,
       'hp', v_max_hp,
       'maxHp', v_max_hp,
       'attack', v_attack,
@@ -929,11 +965,33 @@ begin
     v_profile.run_gold := v_profile.run_gold + v_reward;
     v_profile.xp := v_profile.xp + 16;
     if random() < 0.33 then
-      v_item := 'saber';
-      v_profile.bag := jsonb_set(v_profile.bag, '{saber}', to_jsonb(coalesce((v_profile.bag->>'saber')::integer, 0) + 1), true);
-      v_message := 'В сундуке: ' || v_reward || ' золота и Шахтёрская сабля. +16 опыта.';
+      v_item := case
+        when v_profile.depth >= 4 and random() < 0.2 then 'sword'
+        when v_profile.depth >= 2 and random() < 0.45 then 'armor'
+        when random() < 0.5 then 'charm'
+        else 'saber'
+      end;
+      v_profile.bag := jsonb_set(v_profile.bag, array[v_item], to_jsonb(coalesce((v_profile.bag->>v_item)::integer, 0) + 1), true);
+      v_message := 'В сундуке: ' || v_reward || ' золота и ' || case v_item when 'saber' then 'Шахтёрская сабля' when 'armor' then 'Панцирь стража' when 'charm' then 'Амулет подземья' when 'sword' then 'Клинок сумерек' else 'Доспех искателя' end || '. +16 опыта.';
     else
       v_message := 'В сундуке лежит ' || v_reward || ' золота. +16 опыта.';
+    end if;
+  elsif v_action = 'cache' then
+    v_reward := 42 + floor(random() * 35)::integer + v_profile.depth * 7;
+    v_profile.run_gold := v_profile.run_gold + v_reward;
+    v_profile.xp := v_profile.xp + 18;
+    if random() < 0.4 then
+      v_item := case
+        when v_profile.depth >= 4 and random() < 0.2 then 'plate'
+        when v_profile.depth >= 4 and random() < 0.35 then 'sword'
+        when v_profile.depth >= 2 and random() < 0.5 then 'armor'
+        when random() < 0.5 then 'charm'
+        else 'saber'
+      end;
+      v_profile.bag := jsonb_set(v_profile.bag, array[v_item], to_jsonb(coalesce((v_profile.bag->>v_item)::integer, 0) + 1), true);
+      v_message := 'В тайнике: ' || v_reward || ' золота и ' || case v_item when 'saber' then 'Шахтёрская сабля' when 'armor' then 'Панцирь стража' when 'charm' then 'Амулет подземья' when 'sword' then 'Клинок сумерек' else 'Доспех искателя' end || '. +18 опыта.';
+    else
+      v_message := 'В тайнике: ' || v_reward || ' золота. +18 опыта.';
     end if;
   elsif v_action = 'trap' then
     v_damage := 8 + floor(random() * 9)::integer + v_profile.depth * 2;
@@ -943,6 +1001,7 @@ begin
       v_outcome := 'defeat';
       v_profile.run_gold := 0;
       v_profile.battles_since_guardian := 0;
+      v_profile.exploration_index := 0;
       v_message := 'Ловушка нанесла ' || v_damage || ' урона. Вы потерпели поражение; походная добыча потеряна.';
     else
       v_message := 'Ловушка нанесла ' || v_damage || ' урона.';
@@ -955,6 +1014,15 @@ begin
   elsif v_action = 'runes' then
     v_profile.xp := v_profile.xp + 22;
     v_message := 'Вы прочли руны: лестницу вниз охраняет хранитель. +22 опыта.';
+  elsif v_action = 'rations' then
+    v_profile.hunger := least(100, v_profile.hunger + 30);
+    v_profile.xp := v_profile.xp + 6;
+    v_message := 'Вы нашли съестные припасы. +30 сытости и +6 опыта.';
+  elsif v_action = 'shrine' then
+    v_heal := least(30, v_profile.max_hp - v_profile.hero_hp);
+    v_profile.hero_hp := v_profile.hero_hp + v_heal;
+    v_profile.xp := v_profile.xp + 12;
+    v_message := 'Алтарь восстановил ' || v_heal || ' HP. +12 опыта.';
   end if;
 
   while v_profile.xp >= v_profile.level * 100 loop
