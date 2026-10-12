@@ -33,6 +33,8 @@ create table if not exists public.ranked_progress (
   claimed_quests text[] not null default '{}',
   hunger integer not null default 100 check (hunger between 0 and 100),
   last_work_at timestamptz,
+  exploration_index integer not null default 0 check (exploration_index between 0 and 5),
+  run_gold integer not null default 0 check (run_gold >= 0),
   battle jsonb,
   updated_at timestamptz not null default now()
 );
@@ -42,7 +44,9 @@ alter table public.ranked_progress
   add column if not exists equipment jsonb not null default '{"weapon":"blade","armor":"coat","charm":null}'::jsonb,
   add column if not exists claimed_quests text[] not null default '{}',
   add column if not exists hunger integer not null default 100 check (hunger between 0 and 100),
-  add column if not exists last_work_at timestamptz;
+  add column if not exists last_work_at timestamptz,
+  add column if not exists exploration_index integer not null default 0 check (exploration_index between 0 and 5),
+  add column if not exists run_gold integer not null default 0 check (run_gold >= 0);
 
 alter table public.ranked_progress enable row level security;
 drop policy if exists "players read own ranked progress" on public.ranked_progress;
@@ -70,7 +74,9 @@ as $$
     'bag', p.bag,
     'equipment', p.equipment,
     'claimed', to_jsonb(p.claimed_quests),
-    'hunger', p.hunger
+    'hunger', p.hunger,
+    'exploration_index', p.exploration_index,
+    'run_gold', p.run_gold
   );
 $$;
 
@@ -324,6 +330,7 @@ begin
     v_hero_hp := 1;
     v_profile.battles_since_guardian := 0;
     v_profile.potions := least(3, v_profile.potions + 1);
+    v_profile.run_gold := 0;
     v_profile.battle := null;
   else
     v_profile.battle := v_battle;
@@ -332,6 +339,7 @@ begin
   update public.ranked_progress set
     hero_hp = v_profile.hero_hp, potions = v_profile.potions,
     battles_since_guardian = v_profile.battles_since_guardian,
+    run_gold = v_profile.run_gold,
     battle = v_profile.battle, updated_at = now()
   where user_id = v_user_id returning * into v_profile;
   return jsonb_build_object(
@@ -451,6 +459,166 @@ begin
 end;
 $$;
 
+create or replace function public.ranked_explore_action(p_choice integer)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_profile public.ranked_progress;
+  v_next_event integer;
+  v_action text;
+  v_message text;
+  v_reward integer := 0;
+  v_xp integer := 0;
+  v_damage integer := 0;
+  v_heal integer := 0;
+  v_item text;
+  v_battle jsonb;
+  v_old_hp integer;
+  v_guardian boolean;
+  v_enemy_name text;
+  v_icon text;
+  v_max_hp integer;
+  v_attack integer;
+  v_outcome text := 'event';
+begin
+  if v_user_id is null then raise exception 'Sign in is required'; end if;
+  if p_choice is null or p_choice not in (-1, 0, 1) then raise exception 'Invalid exploration choice'; end if;
+  select * into v_profile
+  from public.ranked_progress
+  where user_id = v_user_id
+  for update;
+  if not found then raise exception 'Create a ranked profile first'; end if;
+  if v_profile.battle is not null then raise exception 'Finish the active battle first'; end if;
+
+  if p_choice = -1 then
+    v_profile.gold := v_profile.gold + v_profile.run_gold;
+    v_profile.run_gold := 0;
+    update public.ranked_progress
+    set gold = v_profile.gold, run_gold = 0, updated_at = now()
+    where user_id = v_user_id returning * into v_profile;
+    return jsonb_build_object(
+      'outcome', 'left',
+      'message', 'Поход завершён. Добыча доставлена в город.',
+      'profile', public.ranked_profile_json(v_profile)
+    );
+  end if;
+  if v_profile.hunger < 4 then raise exception 'Not enough hunger to explore'; end if;
+
+  v_next_event := (v_profile.exploration_index + 1) % 6;
+  case v_profile.exploration_index
+    when 0 then v_action := case p_choice when 0 then 'fight' else 'loot' end;
+    when 1 then v_action := case p_choice when 0 then 'treasure' else 'fight' end;
+    when 2 then v_action := case p_choice when 0 then 'trap' else 'loot' end;
+    when 3 then v_action := case p_choice when 0 then 'spring' else 'treasure' end;
+    when 4 then v_action := case p_choice when 0 then 'loot' else 'fight' end;
+    when 5 then v_action := case p_choice when 0 then 'runes' else 'fight' end;
+    else raise exception 'Invalid exploration state';
+  end case;
+
+  v_profile.hunger := v_profile.hunger - 4;
+  v_profile.exploration_index := v_next_event;
+  if v_action = 'fight' then
+    v_guardian := v_profile.battles_since_guardian >= 3;
+    if v_guardian then
+      v_enemy_name := 'Хранитель прохода';
+      v_icon := '👹';
+      v_max_hp := 65 + v_profile.depth * 23 + floor(random() * 9)::integer;
+      v_attack := 8 + v_profile.depth * 3 + floor(random() * 4)::integer;
+    else
+      case floor(random() * 4)::integer
+        when 0 then v_enemy_name := 'Пещерный зверь'; v_icon := '🐺';
+        when 1 then v_enemy_name := 'Костяной дозорный'; v_icon := '💀';
+        when 2 then v_enemy_name := 'Голодный ползун'; v_icon := '🕷';
+        else v_enemy_name := 'Крысолов'; v_icon := '🐀';
+      end case;
+      v_max_hp := 32 + v_profile.depth * 12 + floor(random() * 9)::integer;
+      v_attack := 5 + v_profile.depth * 2 + floor(random() * 4)::integer;
+    end if;
+    v_battle := jsonb_build_object(
+      'name', v_enemy_name,
+      'icon', v_icon,
+      'guardian', v_guardian,
+      'hp', v_max_hp,
+      'maxHp', v_max_hp,
+      'attack', v_attack,
+      'skillCooldown', 0
+    );
+    v_profile.battle := v_battle;
+    v_message := v_enemy_name || ' преграждает путь. Бой рассчитывается сервером.';
+    v_outcome := 'battle';
+  elsif v_action = 'loot' then
+    v_reward := 18 + floor(random() * 19)::integer + v_profile.depth * 5;
+    v_profile.run_gold := v_profile.run_gold + v_reward;
+    v_profile.xp := v_profile.xp + 12;
+    v_message := 'Вы нашли ' || v_reward || ' золота. Оно в походной сумке. +12 опыта.';
+  elsif v_action = 'treasure' then
+    v_reward := 28 + floor(random() * 28)::integer + v_profile.depth * 5;
+    v_profile.run_gold := v_profile.run_gold + v_reward;
+    v_profile.xp := v_profile.xp + 16;
+    if random() < 0.33 then
+      v_item := 'saber';
+      v_profile.bag := jsonb_set(v_profile.bag, '{saber}', to_jsonb(coalesce((v_profile.bag->>'saber')::integer, 0) + 1), true);
+      v_message := 'В сундуке: ' || v_reward || ' золота и Шахтёрская сабля. +16 опыта.';
+    else
+      v_message := 'В сундуке лежит ' || v_reward || ' золота. +16 опыта.';
+    end if;
+  elsif v_action = 'trap' then
+    v_damage := 8 + floor(random() * 9)::integer + v_profile.depth * 2;
+    v_old_hp := v_profile.hero_hp;
+    v_profile.hero_hp := greatest(1, v_old_hp - v_damage);
+    if v_damage >= v_old_hp then
+      v_outcome := 'defeat';
+      v_profile.run_gold := 0;
+      v_profile.battles_since_guardian := 0;
+      v_message := 'Ловушка нанесла ' || v_damage || ' урона. Вы потерпели поражение; походная добыча потеряна.';
+    else
+      v_message := 'Ловушка нанесла ' || v_damage || ' урона.';
+    end if;
+  elsif v_action = 'spring' then
+    v_heal := least(24, 100 - v_profile.hero_hp);
+    v_profile.hero_hp := v_profile.hero_hp + v_heal;
+    v_profile.xp := v_profile.xp + 10;
+    v_message := 'Источник восстановил ' || v_heal || ' HP. +10 опыта.';
+  elsif v_action = 'runes' then
+    v_profile.xp := v_profile.xp + 22;
+    v_message := 'Вы прочли руны: лестницу вниз охраняет хранитель. +22 опыта.';
+  end if;
+
+  while v_profile.xp >= v_profile.level * 100 loop
+    v_profile.xp := v_profile.xp - v_profile.level * 100;
+    v_profile.level := v_profile.level + 1;
+  end loop;
+
+  update public.ranked_progress
+  set level = v_profile.level,
+      xp = v_profile.xp,
+      hero_hp = v_profile.hero_hp,
+      bag = v_profile.bag,
+      hunger = v_profile.hunger,
+      exploration_index = v_profile.exploration_index,
+      run_gold = v_profile.run_gold,
+      battles_since_guardian = v_profile.battles_since_guardian,
+      battle = v_profile.battle,
+      updated_at = now()
+  where user_id = v_user_id
+  returning * into v_profile;
+
+  return jsonb_build_object(
+    'outcome', v_outcome,
+    'message', v_message,
+    'battle', v_profile.battle,
+    'profile', public.ranked_profile_json(v_profile)
+  );
+end;
+$$;
+
+revoke all on function public.ranked_explore_action(integer) from public, anon, authenticated;
+grant execute on function public.ranked_explore_action(integer) to authenticated;
+
 revoke all on function public.ranked_economy_action(text, text, text) from public, anon, authenticated;
 grant execute on function public.ranked_economy_action(text, text, text) to authenticated;
 
@@ -459,10 +627,11 @@ revoke all on function public.ranked_start_profile(text) from public, anon, auth
 revoke all on function public.ranked_rest() from public, anon, authenticated;
 revoke all on function public.ranked_start_battle() from public, anon, authenticated;
 revoke all on function public.ranked_battle_action(text) from public, anon, authenticated;
+revoke all on function public.ranked_explore_action(integer) from public, anon, authenticated;
 grant execute on function public.ranked_start_profile(text) to authenticated;
 grant execute on function public.ranked_rest() to authenticated;
-grant execute on function public.ranked_start_battle() to authenticated;
 grant execute on function public.ranked_battle_action(text) to authenticated;
+grant execute on function public.ranked_explore_action(integer) to authenticated;
 
 drop view if exists public.player_leaderboard;
 create view public.player_leaderboard
