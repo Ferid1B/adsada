@@ -53,3 +53,17 @@
 @keyframes shield-flash{0%,100%{opacity:0;transform:scale(.8)}35%{opacity:1;transform:scale(1.08)}}
 @media(max-width:550px){#battleModal .combatants{min-height:145px;margin:18px -12px;padding:14px 6px 10px}#battleModal .fighter.enemy .fighter-icon{width:96px;height:96px}.fighter-icon{width:68px;height:68px}#battleModal .battle-box{padding:20px}.battle-modal.battle-block .fighter:not(.enemy):after{left:12%;width:60px;height:72px}}
 @media(prefers-reduced-motion:reduce){.monster-art,.monster-art *{animation:none!important}.combat-number{animation:none;opacity:1}.battle-modal.hero-strike .combatants:after,.battle-modal.enemy-strike .combatants:after{animation:none;opacity:.5}.battle-modal.battle-block .fighter:not(.enemy):after{animation:none;opacity:.7}}
+/* Isometric village terrain with layered cliffs, architecture and harbor */
+.city-map{background:linear-gradient(145deg,#60756a,#233c42 70%);border-color:#9a9376;box-shadow:0 28px 65px #0009,inset 0 0 55px #10181066;perspective:1100px}
+.map-art{filter:saturate(.88) contrast(1.06) drop-shadow(0 18px 16px #0005);transform:scale(1.025);transform-origin:50% 58%;transition:transform .65s cubic-bezier(.2,.7,.2,1),filter .4s}
+.city-map:hover .map-art{transform:scale(1.045);filter:saturate(.98) contrast(1.08) drop-shadow(0 20px 18px #0006)}
+.city-map:before{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;background:radial-gradient(ellipse at 48% 42%,transparent 36%,#09131332 100%),linear-gradient(145deg,#fff1 0,transparent 35%,#0b14132b 100%)}
+.map-pin{z-index:3}
+.map-pin i{border-color:#ecd49e;background:linear-gradient(145deg,#66776b 0,#34433e 43%,#182326 100%);box-shadow:inset 0 2px 3px #fff5,inset 0 -5px 9px #091211a8,0 8px 0 #161d1a,0 11px 16px #000b;text-shadow:0 2px 3px #000}
+.map-pin:hover i,.map-pin:focus-visible i{transform:translateY(-8px) scale(1.08);box-shadow:inset 0 2px 3px #fff8,inset 0 -5px 9px #091211a8,0 12px 0 #161d1a,0 17px 22px #000b,0 0 22px #e6bd7355}
+.map-pin span{border-color:#e2d0a455;background:linear-gradient(180deg,#262b25ed,#111816ed);box-shadow:0 3px 8px #0009}
+.pin-well i{background:radial-gradient(circle at 35% 28%,#9cc2c2,#476f78 38%,#172c34 78%);box-shadow:inset 0 3px 6px #eaf8e999,inset 0 -8px 12px #071419,0 8px 0 #17201e,0 12px 18px #000b,0 0 26px #8ad0d455}
+.map-compass{z-index:3;padding:7px 9px;border:1px solid #d7c18b66;border-radius:22px;background:linear-gradient(145deg,#27352ee8,#131a19e8);box-shadow:0 5px 14px #0008}
+.map-footer{z-index:3;padding:9px 12px;border:1px solid #d7c18b3d;border-radius:8px;background:linear-gradient(90deg,#121a18c9,#10171480);backdrop-filter:blur(5px)}
+@media(max-width:550px){.city-map{min-height:230px}.map-art{transform:scale(1.035)}.city-map:hover .map-art{transform:scale(1.04)}.map-pin i{box-shadow:inset 0 2px 3px #fff5,inset 0 -4px 7px #091211a8,0 5px 0 #161d1a,0 7px 11px #000b}.pin-inn{top:74%}.map-footer{display:none}}
+@media(prefers-reduced-motion:reduce){.map-art,.city-map:hover .map-art{transition:none;transform:none}}
